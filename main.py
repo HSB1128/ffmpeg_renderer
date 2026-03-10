@@ -296,8 +296,10 @@ def render():
         durations_sec = data.get("durations_sec")
         fps = int(data.get("fps", 30))
 
-        # VEO 모드용 옵션
+        # VEO/GROK 공통 마지막 씬 여운
         tail_extra_sec = float(data.get("tail_extra_sec", 2.0))
+
+        # VEO 모드용 옵션
         last_audio_take_rest = parse_bool(data.get("last_audio_take_rest", True))
 
         # 하위호환
@@ -379,11 +381,11 @@ def render():
                         fps=fps
                     )
 
-                    # veo 모드에서만 마지막 영상 여운 추가
-                    if is_last and tail_extra_sec > 0:
-                        fixed_tail = os.path.join(tmpdir, f"video_fixed_tail_{i}.mp4")
-                        video_sec = pad_video_tail(fixed_vp, fixed_tail, tail_extra_sec, fps)
-                        fixed_vp = fixed_tail
+                # 2-1) 마지막 씬 여운 추가 (VEO / GROK 공통)
+                if is_last and tail_extra_sec > 0:
+                    fixed_tail = os.path.join(tmpdir, f"video_fixed_tail_{i}.mp4")
+                    video_sec = pad_video_tail(fixed_vp, fixed_tail, tail_extra_sec, fps)
+                    fixed_vp = fixed_tail
 
                 # 3) 오디오 구간 계산
                 remaining = max(0.0, audio_total_sec - cur_start)
@@ -391,8 +393,8 @@ def render():
 
                 if mode == "grok":
                     if is_last:
-                        # 마지막 씬은 영상 6초를 끝까지 사용
-                        # 오디오는 남은 만큼만 가져오고, 영상 길이에 맞춰 무음 패딩
+                        # 마지막 씬은 영상 전체(원본 사용분 + tail) 길이에 맞춤
+                        # 오디오는 남은 만큼만 가져오고, video_sec까지 무음 패딩
                         audio_seg_sec = min(remaining, video_sec)
 
                         cut_audio_segment_to_aac(
@@ -402,7 +404,7 @@ def render():
                             dur_sec=audio_seg_sec,
                             pad_to_sec=video_sec
                         )
-                        note = "Grok last: use full last video; audio padded to full video if needed"
+                        note = "Grok last: use full last video + tail; audio padded to full video if needed"
                     else:
                         # 일반 씬은 duration만큼 정확히 잘라 사용
                         audio_seg_sec = min(target_sec, remaining)
@@ -454,6 +456,7 @@ def render():
                     "target_script_sec": round(target_sec, 3),
                     "audio_cut_sec": round(audio_seg_sec, 3),
                     "video_final_sec": round(video_sec, 3),
+                    "tail_extra_sec": round(tail_extra_sec, 3) if is_last else 0.0,
                     "note": note
                 })
 
@@ -486,7 +489,7 @@ def render():
             "videoCount": len(videos),
             "audio_total_sec": round(audio_total_sec, 3),
             "sum_script_sec": round(sum_script, 3),
-            "tail_extra_sec": round(tail_extra_sec, 3) if mode == "veo" else 0.0,
+            "tail_extra_sec": round(tail_extra_sec, 3),
             "last_audio_take_rest": last_audio_take_rest if mode == "veo" else False,
             "debug": debug_scenes
         }), 200
