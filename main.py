@@ -1,10 +1,10 @@
 import os
 import json
+import shutil
 import subprocess
 import tempfile
 
-from flask import Flask, request, jsonify
-from google.cloud import storage
+from flask import Flask, request, jsonify, send_file
 
 app = Flask(__name__)
 
@@ -13,6 +13,7 @@ app = Flask(__name__)
 # =========================
 TARGET_W = 1080
 TARGET_H = 1920
+MEDIA_DIR = os.getenv("MEDIA_DIR", "/media")
 
 VF_916 = (
     f"scale={TARGET_W}:{TARGET_H}:force_original_aspect_ratio=decrease,"
@@ -31,6 +32,55 @@ def root():
 @app.get("/health")
 def health():
     return "ok", 200
+
+
+# =========================
+# Local storage endpoints
+# =========================
+@app.post("/save")
+def save_file():
+    """
+    로컬 볼륨에 파일을 저장합니다.
+    Query param: path (상대경로, 예: ID(Production)/audio.mp3)
+    Body: 저장할 바이너리 데이터
+    """
+    rel_path = request.args.get("path", "").strip()
+    if not rel_path:
+        return jsonify({"ok": False, "error": "path query param is required"}), 400
+
+    content_type = request.content_type or "application/octet-stream"
+    abs_path = os.path.join(MEDIA_DIR, rel_path)
+    os.makedirs(os.path.dirname(abs_path), exist_ok=True)
+
+    data = request.get_data()
+    with open(abs_path, "wb") as f:
+        f.write(data)
+
+    return jsonify({
+        "ok": True,
+        "name": rel_path,
+        "contentType": content_type,
+        "size": len(data),
+    }), 200
+
+
+@app.get("/file")
+def get_file():
+    """
+    로컬 볼륨에서 파일을 서빙합니다.
+    Query param: path (상대경로 또는 절대경로)
+    """
+    path = request.args.get("path", "").strip()
+    if not path:
+        return jsonify({"ok": False, "error": "path query param is required"}), 400
+
+    if not os.path.isabs(path):
+        path = os.path.join(MEDIA_DIR, path)
+
+    if not os.path.exists(path):
+        return jsonify({"ok": False, "error": f"file not found: {path}"}), 404
+
+    return send_file(path, mimetype="video/mp4")
 
 
 # =========================
@@ -331,22 +381,12 @@ def render():
                         "error": f"grok mode requires every duration <= 6.0 sec (index={i}, value={d:.3f})"
                     }), 400
 
-        client = storage.Client()
-
-        def download_gs(gs_path: str, local_path: str):
-            bucket_name, blob_name = gs_path.replace("gs://", "").split("/", 1)
-            bucket = client.bucket(bucket_name)
-            bucket.blob(blob_name).download_to_filename(local_path)
-
-        def upload_gs(local_path: str, gs_path: str):
-            bucket_name, blob_name = gs_path.replace("gs://", "").split("/", 1)
-            bucket = client.bucket(bucket_name)
-            bucket.blob(blob_name).upload_from_filename(local_path, content_type="video/mp4")
+        # 출력 디렉터리 생성
+        os.makedirs(os.path.dirname(os.path.abspath(output)), exist_ok=True)
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            # 1) Download Audio
-            audio_path = os.path.join(tmpdir, "audio.mp3")
-            download_gs(audio, audio_path)
+            # 1) 오디오 경로 (로컬 파일 직접 사용)
+            audio_path = audio
             audio_total_sec = ffprobe_duration_sec(audio_path)
 
             seg_paths = []
@@ -355,13 +395,11 @@ def render():
             cur_start = 0.0
             sum_script = sum(durations_sec)
 
-            for i, (gs_url, dur) in enumerate(zip(videos, durations_sec)):
+            for i, (video_path, dur) in enumerate(zip(videos, durations_sec)):
                 target_sec = float(dur)
                 is_last = (i == len(videos) - 1)
 
-                raw_vp = os.path.join(tmpdir, f"video_raw_{i}.mp4")
-                download_gs(gs_url, raw_vp)
-
+                raw_vp = video_path  # 로컬 파일 직접 사용
                 fixed_vp = os.path.join(tmpdir, f"video_fixed_{i}.mp4")
 
                 # 2) 비디오 길이 처리
@@ -393,10 +431,7 @@ def render():
 
                 if mode == "grok":
                     if is_last:
-                        # 마지막 씬은 영상 전체(원본 사용분 + tail) 길이에 맞춤
-                        # 오디오는 남은 만큼만 가져오고, video_sec까지 무음 패딩
                         audio_seg_sec = min(remaining, video_sec)
-
                         cut_audio_segment_to_aac(
                             audio_in=audio_path,
                             audio_out=audio_seg,
@@ -406,9 +441,7 @@ def render():
                         )
                         note = "Grok last: use full last video + tail; audio padded to full video if needed"
                     else:
-                        # 일반 씬은 duration만큼 정확히 잘라 사용
                         audio_seg_sec = min(target_sec, remaining)
-
                         cut_audio_segment_to_aac(
                             audio_in=audio_path,
                             audio_out=audio_seg,
@@ -460,8 +493,6 @@ def render():
                     "note": note
                 })
 
-                # 컷 전환 기준 타임라인 이동
-                # grok도 일반 씬/마지막 씬 모두 script timeline 기준으로 이동
                 cur_start += target_sec
 
             # 5) Concat segments
@@ -480,7 +511,8 @@ def render():
                 final_video
             ])
 
-            upload_gs(final_video, output)
+            # 6) 로컬 출력 경로에 복사 (GCS 업로드 대신)
+            shutil.copy2(final_video, output)
 
         return jsonify({
             "ok": True,
